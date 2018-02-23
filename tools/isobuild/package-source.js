@@ -17,7 +17,7 @@ import SourceArch from './source-arch.js';
 import { PackageNamespace } from "./package-namespace.js";
 import { PackageNpm } from "./package-npm.js";
 import { PackageCordova } from "./package-cordova.js";
-import { PackageAPI } from "./package-api.js";
+import { PackageAPI, mapWhereToArch } from "./package-api.js";
 
 import {
   TEST_FILENAME_REGEXPS,
@@ -29,10 +29,11 @@ import {
 } from '../utils/colon-converter.js';
 
 import {
-  optimisticReadFile,
   optimisticHashOrNull,
-  optimisticStatOrNull,
+  optimisticReadFile,
+  optimisticReadJsonOrNull,
   optimisticReadMeteorIgnore,
+  optimisticStatOrNull,
 } from "../fs/optimistic.js";
 
 // XXX: This is a medium-term hack, to avoid having the user set a package name
@@ -837,7 +838,49 @@ _.extend(PackageSource.prototype, {
                   constraint: constraint.constraintString });
     });
 
-    var projectWatchSet = projectContext.getProjectWatchSet();
+    const projectWatchSet = projectContext.getProjectWatchSet();
+    const packageJsonPath = files.pathResolve(appDir, "package.json");
+    const packageJson = optimisticReadJsonOrNull(packageJsonPath);
+
+    projectWatchSet.addFile(
+      packageJsonPath,
+      packageJson
+        ? optimisticHashOrNull(packageJsonPath)
+        : null
+    );
+
+    const meteorConfig = packageJson && packageJson.meteor || null;
+    const mainModulesByArch = Object.create(null);
+
+    if (meteorConfig) {
+      const mainModule = meteorConfig.mainModule;
+      if (typeof mainModule === "string") {
+        // If packageJson.meteor.mainModule is a string, use that string
+        // as the mainModule for all architectures.
+        mainModulesByArch["os"] = mainModule;
+        mainModulesByArch["web"] = mainModule;
+      } else if (mainModule && typeof mainModule === "object") {
+        // If packageJson.meteor.mainModule is an object, use its
+        // properties to select a mainModule for each architecture.
+        Object.keys(mainModule).forEach(where => {
+          mainModulesByArch[mapWhereToArch(where)] =
+            files.pathNormalize(mainModule[where]);
+        });
+      }
+    }
+
+    // Given an architecture like web.browser, get the best mainModule for
+    // that architecture. For example, if meteorConfig.mainModule.client
+    // is defined, then because mapWhereToArch("client") === "web", and
+    // "web" matches web.browser, return meteorConfig.mainModule.client.
+    function getMainModuleForArch(arch) {
+      const mainMatch = archinfo.mostSpecificMatch(
+        arch, Object.keys(mainModulesByArch));
+
+      if (mainMatch) {
+        return mainModulesByArch[mainMatch];
+      }
+    }
 
     _.each(compiler.ALL_ARCHES, function (arch) {
       // We don't need to build a Cordova SourceArch if there are no Cordova
@@ -846,6 +889,8 @@ _.extend(PackageSource.prototype, {
           _.isEmpty(projectContext.platformList.getCordovaPlatforms())) {
         return;
       }
+
+      const mainModule = getMainModuleForArch(arch);
 
       // XXX what about /web.browser/* etc, these directories could also
       // be for specific client targets.
@@ -867,20 +912,45 @@ _.extend(PackageSource.prototype, {
             isApp: true,
           };
 
-          return {
-            sources: self._findSources(findOptions).sort(
-              loadOrderSort(sourceProcessorSet, arch)
-            ).map(relPath => {
-              return {
-                relPath,
-                fileOptions: self._inferFileOptions(relPath, {
-                  arch,
-                  isApp: true,
-                }),
-              };
-            }),
+          // If this architecture has a mainModule defined in
+          // package.json, it's an error if _findSources doesn't find that
+          // module. If no mainModule is defined, anything goes.
+          let missingMainModule = !! mainModule;
 
-            assets: self._findAssets(findOptions),
+          const sources = self._findSources(findOptions).sort(
+            loadOrderSort(sourceProcessorSet, arch)
+          ).map(relPath => {
+            if (relPath === mainModule) {
+              missingMainModule = false;
+            }
+
+            const fileOptions = self._inferFileOptions(relPath, {
+              arch,
+              isApp: true,
+              // When mainModule is truthy, fileOptions.lazy will be true
+              // unless relPath === mainModule. This effectively makes all
+              // files lazy except the mainModule.
+              mainModule,
+            });
+
+            return {
+              relPath,
+              fileOptions,
+            };
+          });
+
+          if (missingMainModule) {
+            buildmessage.error([
+              "Missing mainModule for '" + arch + "' architecture: " + mainModule,
+              'Check the "meteor" section of your package.json file?'
+            ].join("\n"));
+          }
+
+          const assets = self._findAssets(findOptions);
+
+          return {
+            sources,
+            assets,
           };
         }
       });
@@ -919,7 +989,11 @@ _.extend(PackageSource.prototype, {
     }
   }),
 
-  _inferFileOptions(relPath, {arch, isApp}) {
+  _inferFileOptions(relPath, {
+    arch,
+    isApp,
+    mainModule,
+  }) {
     const fileOptions = {};
     const isTest = global.testCommandMetadata
       && global.testCommandMetadata.isTest;
@@ -971,6 +1045,17 @@ _.extend(PackageSource.prototype, {
           archinfo.matches(arch, "web") &&
           relPath.endsWith(".js")) {
         fileOptions.bare = true;
+      }
+    }
+
+    if (isApp && mainModule) {
+      if (relPath === mainModule) {
+        fileOptions.lazy = false;
+        fileOptions.mainModule = true;
+      } else if (typeof fileOptions.lazy === "undefined") {
+        // Used in ResourceSlot#_isLazy (in compiler-plugin.js) to make a
+        // final determination of whether the file should be lazy.
+        fileOptions.mainModule = false;
       }
     }
 
